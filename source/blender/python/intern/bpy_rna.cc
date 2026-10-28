@@ -4666,6 +4666,7 @@ static PyObject *pyrna_struct_id_properties_ensure(BPy_StructRNA *self)
   BPy_IDProperty *group = PyObject_New(BPy_IDProperty, &BPy_IDGroup_Type);
   group->owner_id = self->ptr->owner_id;
   group->prop = idprops;
+  BPy_IDProperty_Register(reinterpret_cast<PyObject *>(group), idprops, &group->prop);
   group->parent = nullptr;
   return reinterpret_cast<PyObject *>(group);
 }
@@ -4715,6 +4716,7 @@ static PyObject *pyrna_struct_id_properties_ui(BPy_StructRNA *self, PyObject *ar
   BPy_IDPropertyUIManager *ui_manager = PyObject_New(BPy_IDPropertyUIManager,
                                                      &BPy_IDPropertyUIManager_Type);
   ui_manager->property = property;
+  BPy_IDProperty_Register(reinterpret_cast<PyObject *>(ui_manager), property, &ui_manager->property);
   return reinterpret_cast<PyObject *>(ui_manager);
 }
 

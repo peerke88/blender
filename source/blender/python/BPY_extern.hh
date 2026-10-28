@@ -19,6 +19,8 @@
 
 namespace blender {
 
+struct IDProperty;
+
 struct ARegionType;
 struct AnimationEvalContext;
 struct ChannelDriver; /* DNA_anim_types.h */
@@ -133,6 +135,8 @@ void BPY_context_dict_clear_members_array(void **dict_p,
 void BPY_id_release(ID *id);
 /** Invalidate Main-owned Python wrappers before the Main allocation is freed. */
 void BPY_pointer_release(void *owner);
+void BPY_idprop_release(IDProperty *property, bool preserve_content);
+void BPY_idprop_invalidate_iterators(IDProperty *property);
 
 /**
  * Free (actually dereference) the Python type object representing the given #StrucRNA type,

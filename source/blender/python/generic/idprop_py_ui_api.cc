@@ -16,6 +16,7 @@
 #include "BLI_utildefines.h"
 
 #include "idprop_py_ui_api.hh"
+#include "idprop_py_api.hh"
 
 #include "BKE_idprop.hh"
 
@@ -700,6 +701,7 @@ static PyObject *BPy_IDPropertyUIManager_update(BPy_IDPropertyUIManager *self,
                                                 PyObject *args,
                                                 PyObject *kwargs)
 {
+  if (!BPy_IDProperty_IsValid(reinterpret_cast<PyObject *>(self))) return nullptr;
   IDProperty *property = self->property;
   BLI_assert(IDP_ui_data_supported(property));
 
@@ -893,6 +895,7 @@ PyDoc_STRVAR(
     "   returned dictionary and their types will depend on the property's type.\n");
 static PyObject *BPy_IDIDPropertyUIManager_as_dict(BPy_IDPropertyUIManager *self)
 {
+  if (!BPy_IDProperty_IsValid(reinterpret_cast<PyObject *>(self))) return nullptr;
   IDProperty *property = self->property;
   BLI_assert(IDP_ui_data_supported(property));
 
@@ -955,6 +958,7 @@ PyDoc_STRVAR(
     "   Remove the RNA UI data from this IDProperty.\n");
 static PyObject *BPy_IDPropertyUIManager_clear(BPy_IDPropertyUIManager *self)
 {
+  if (!BPy_IDProperty_IsValid(reinterpret_cast<PyObject *>(self))) return nullptr;
   IDProperty *property = self->property;
   BLI_assert(IDP_ui_data_supported(property));
 
@@ -988,6 +992,7 @@ PyDoc_STRVAR(
     "   :raises TypeError: If the types of the two properties don't match.\n");
 static PyObject *BPy_IDPropertyUIManager_update_from(BPy_IDPropertyUIManager *self, PyObject *args)
 {
+  if (!BPy_IDProperty_IsValid(reinterpret_cast<PyObject *>(self))) return nullptr;
   IDProperty *property = self->property;
   BLI_assert(IDP_ui_data_supported(property));
 
@@ -996,6 +1001,7 @@ static PyObject *BPy_IDPropertyUIManager_update_from(BPy_IDPropertyUIManager *se
     return nullptr;
   }
 
+  if (!BPy_IDProperty_IsValid(reinterpret_cast<PyObject *>(ui_manager_src))) return nullptr;
   IDProperty *src_prop = ui_manager_src->property;
   if ((property->type != src_prop->type) || property->subtype != src_prop->subtype) {
     PyErr_SetString(PyExc_TypeError, "Properties type does not match.");
@@ -1059,13 +1065,20 @@ static PyMethodDef BPy_IDPropertyUIManager_methods[] = {
 
 static PyObject *BPy_IDPropertyUIManager_repr(BPy_IDPropertyUIManager *self)
 {
+  if (!self->property) return PyUnicode_FromString("<bpy id prop ui manager removed>");
   return PyUnicode_FromFormat(
       "<bpy id prop ui manager: name=\"%s\", address=%p>", self->property->name, self->property);
 }
 
 static Py_hash_t BPy_IDPropertyUIManager_hash(BPy_IDPropertyUIManager *self)
 {
-  return Py_HashPointer(self->property);
+  return BPy_IDProperty_Hash(reinterpret_cast<PyObject *>(self));
+}
+
+static void idprop_ui_dealloc(PyObject *object)
+{
+  BPy_IDProperty_Unregister(object);
+  PyObject_Del(object);
 }
 
 PyTypeObject BPy_IDPropertyUIManager_Type = {
@@ -1074,7 +1087,7 @@ PyTypeObject BPy_IDPropertyUIManager_Type = {
     /*tp_name*/ "IDPropertyUIManager",
     /*tp_basicsize*/ sizeof(BPy_IDPropertyUIManager),
     /*tp_itemsize*/ 0,
-    /*tp_dealloc*/ nullptr,
+    /*tp_dealloc*/ idprop_ui_dealloc,
     /*tp_vectorcall_offset*/ 0,
     /*tp_getattr*/ nullptr,
     /*tp_setattr*/ nullptr,

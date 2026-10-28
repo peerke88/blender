@@ -34,6 +34,10 @@
 
 #include "BLO_read_write.hh"
 
+#ifdef WITH_PYTHON
+#  include "BPY_extern.hh"
+#endif
+
 #include "BLI_strict_flags.h" /* IWYU pragma: keep. Keep last. */
 
 namespace blender {
@@ -136,6 +140,9 @@ static void IDP_FreeIDPArray(IDProperty *prop, const bool do_id_user, const int 
   BLI_assert(prop->type == IDP_IDPARRAY);
 
   for (int i = 0; i < prop->len; i++) {
+#ifdef WITH_PYTHON
+  BPY_idprop_release(GETPROP(prop, i), false);
+#endif
     idp_free_property_content_recurse(GETPROP(prop, i), do_id_user, recursion_depth + 1);
   }
 
@@ -153,6 +160,9 @@ void IDP_SetIndexArray(IDProperty *prop, int index, IDProperty *item)
 
   IDProperty *old = GETPROP(prop, index);
   if (item != old) {
+#ifdef WITH_PYTHON
+  BPY_idprop_release(old, false);
+#endif
     idp_free_property_content_recurse(old, true, 0);
 
     memcpy(old, item, sizeof(IDProperty));
@@ -205,6 +215,9 @@ void IDP_ResizeIDPArray(IDProperty *prop, int newlen)
   if (newlen <= prop->totallen) {
     if (newlen < prop->len && prop->totallen - newlen < IDP_ARRAY_REALLOC_LIMIT) {
       for (int i = newlen; i < prop->len; i++) {
+#ifdef WITH_PYTHON
+        BPY_idprop_release(GETPROP(prop, i), false);
+#endif
         IDP_ClearProperty(GETPROP(prop, i));
       }
 
@@ -221,11 +234,20 @@ void IDP_ResizeIDPArray(IDProperty *prop, int newlen)
   if (newlen < prop->len) {
     /* newlen is smaller */
     for (int i = newlen; i < prop->len; i++) {
+#ifdef WITH_PYTHON
+      BPY_idprop_release(GETPROP(prop, i), false);
+#endif
       IDP_ClearProperty(GETPROP(prop, i));
     }
   }
 
   const int newsize = idp_resize_grow_size_calc(newlen);
+#ifdef WITH_PYTHON
+  for (int i = 0; i < prop->len; i++) {
+    IDP_foreach_property(GETPROP(prop, i), 0,
+                         [](IDProperty *child) { BPY_idprop_release(child, true); });
+  }
+#endif
   prop->data.pointer = MEM_realloc_zeroed(prop->data.pointer,
                                           sizeof(IDProperty) * size_t(newsize));
   prop->len = newlen;
@@ -259,6 +281,9 @@ static void idp_resize_group_array(
 
 void IDP_ResizeArray(IDProperty *prop, int newlen)
 {
+#ifdef WITH_PYTHON
+  if (newlen != prop->len) BPY_idprop_release(prop, true);
+#endif
   const bool is_grow = newlen >= prop->len;
 
   /* first check if the array buffer size has room */
@@ -713,6 +738,9 @@ void IDP_ReplaceInGroup_ex(IDProperty *group,
   BLI_assert(prop_exist == IDP_GetPropertyFromGroup(group, prop->name));
 
   if (prop_exist != nullptr) {
+#ifdef WITH_PYTHON
+    BPY_idprop_invalidate_iterators(group);
+#endif
     /* Insert the new property at the same position as the old one in the linked list. */
     BLI_insertlinkreplace(&group->data.group, prop_exist, prop);
     BLI_assert(group->data.children_map);
@@ -782,6 +810,9 @@ bool IDP_AddToGroup(IDProperty *group, IDProperty *prop)
 
   idp_group_children_map_ensure(*group);
   if (group->data.children_map->children.add(prop)) {
+#ifdef WITH_PYTHON
+    BPY_idprop_invalidate_iterators(group);
+#endif
     group->len++;
     BLI_addtail(&group->data.group, prop);
     return true;
@@ -794,6 +825,9 @@ void IDP_RemoveFromGroup(IDProperty *group, IDProperty *prop)
   BLI_assert(group->type == IDP_GROUP);
   BLI_assert(BLI_findindex(&group->data.group, prop) != -1);
 
+#ifdef WITH_PYTHON
+  BPY_idprop_invalidate_iterators(group);
+#endif
   group->len--;
   BLI_remlink(&group->data.group, prop);
   BLI_assert(group->data.children_map);
@@ -845,6 +879,9 @@ static void IDP_FreeGroup(IDProperty *prop, const bool do_id_user, const int rec
 
   MEM_SAFE_DELETE(prop->data.children_map);
   for (IDProperty &loop : prop->data.group) {
+#ifdef WITH_PYTHON
+    BPY_idprop_release(&loop, false);
+#endif
     idp_free_property_content_recurse(&loop, do_id_user, recursion_depth + 1);
   }
   prop->data.group.free_no_destruct();
@@ -1382,6 +1419,9 @@ static void idp_free_property_recurse(IDProperty *prop,
                                       const bool do_id_user,
                                       const int recursion_depth)
 {
+#ifdef WITH_PYTHON
+  BPY_idprop_release(prop, false);
+#endif
   idp_free_property_content_recurse(prop, do_id_user, recursion_depth);
   MEM_delete(prop);
 }
@@ -1398,6 +1438,10 @@ void IDP_FreeProperty(IDProperty *prop)
 
 void IDP_ClearProperty(IDProperty *prop)
 {
+#ifdef WITH_PYTHON
+  if (prop->type == IDP_GROUP) BPY_idprop_invalidate_iterators(prop);
+  else BPY_idprop_release(prop, false);
+#endif
   idp_free_property_content_recurse(prop, true, 0);
   prop->data.pointer = nullptr;
   prop->len = prop->totallen = 0;

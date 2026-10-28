@@ -103,6 +103,12 @@ struct BPy_IDGroup_View {
                                                         PyObject *ob);
 void IDProp_Init_Types();
 
+/* Lifetime registration keeps the existing private wrapper layout unchanged. */
+void BPy_IDProperty_Register(PyObject *object, IDProperty *property, IDProperty **slot);
+void BPy_IDProperty_Unregister(PyObject *object);
+bool BPy_IDProperty_IsValid(PyObject *object);
+Py_hash_t BPy_IDProperty_Hash(PyObject *object);
+
 [[nodiscard]] PyObject *BPyInit_idprop();
 
 /**
