@@ -349,8 +349,25 @@ void GLBackend::platform_init()
     glGetUnsignedBytei_vEXT(GL_DEVICE_UUID_EXT, 0, device_uuid);
     GPG.device_uuid = Array<uint8_t, 16>(Span<uint8_t>(device_uuid, GL_UUID_SIZE_EXT));
 
+    /* This AMD Windows driver advertises EXT_memory_object_win32, but the
+     * DEVICE_NODE_MASK_EXT query raises GL_INVALID_ENUM. Do not publish an
+     * incomplete LUID/node pair or consume an error to hide the failed query.
+     * Leave this optional identity unavailable; OIDN can fall back to UUID.
+     * Restrict the workaround to the measured renderer and driver version. */
+    const bool broken_luid_query = (device & GPU_DEVICE_ATI) && (os & GPU_OS_WIN) &&
+                                   (driver & GPU_DRIVER_OFFICIAL) &&
+                                   StringRef(renderer) == "AMD Radeon(TM) 890M Graphics" &&
+                                   StringRef(version) ==
+                                       "4.6.0 Core Profile Context 25.3.1.250220";
+    if (broken_luid_query) {
+      CLOG_WARN(&LOG, "Disabling LUID/node-mask identity on AMD 890M driver 25.3.1.250220: "
+                      "DEVICE_NODE_MASK_EXT raises GL_INVALID_ENUM; using UUID fallback");
+    }
+
     /* LUID is only supported on Windows. */
-    if (epoxy_has_gl_extension("GL_EXT_memory_object_win32") && (os & GPU_OS_WIN)) {
+    if (epoxy_has_gl_extension("GL_EXT_memory_object_win32") && (os & GPU_OS_WIN) &&
+        !broken_luid_query)
+    {
       GLubyte device_luid[GL_LUID_SIZE_EXT] = {0};
       glGetUnsignedBytevEXT(GL_DEVICE_LUID_EXT, device_luid);
       GPG.device_luid = Array<uint8_t, 8>(Span<uint8_t>(device_luid, GL_LUID_SIZE_EXT));
