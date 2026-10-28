@@ -17,7 +17,7 @@
 
 namespace blender {
 
-#ifdef WITH_PYTHON_SAFETY
+#if 1 /* Inka: mandatory lifetime invalidation for the embedded editor. */
 
 /**
  * Play it safe and keep optional for now,
@@ -183,6 +183,7 @@ struct BPy_PropertyCollectionIterRNA {
 
   /* collection iterator specific parts */
   std::optional<CollectionPropertyIterator> iter;
+  bool invalidated;
 };
 
 struct BPy_FunctionRNA {

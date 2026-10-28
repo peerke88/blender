@@ -9,6 +9,9 @@
  */
 
 #include <cstring>
+#ifdef WITH_PYTHON
+#  include "BPY_extern.hh"
+#endif
 #include <iostream>
 
 #include "CLG_log.h"
@@ -199,6 +202,9 @@ void BKE_main_clear(Main &bmain)
 
 void BKE_main_free(Main *bmain)
 {
+#ifdef WITH_PYTHON
+  BPY_pointer_release(bmain);
+#endif
   MEM_delete(bmain);
 }
 

@@ -131,6 +131,8 @@ void BPY_context_dict_clear_members_array(void **dict_p,
                                           uint context_members_len);
 
 void BPY_id_release(ID *id);
+/** Invalidate Main-owned Python wrappers before the Main allocation is freed. */
+void BPY_pointer_release(void *owner);
 
 /**
  * Free (actually dereference) the Python type object representing the given #StrucRNA type,

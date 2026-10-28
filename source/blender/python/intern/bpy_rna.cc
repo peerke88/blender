@@ -13,6 +13,8 @@
  */
 
 #include <Python.h>
+#include <memory>
+#include <unordered_map>
 
 #include <cfloat> /* FLT_MIN/MAX */
 #include <cstddef>
@@ -263,128 +265,88 @@ static void id_release_gc(struct ID *id)
 }
 #endif
 
-#ifdef USE_PYRNA_INVALIDATE_WEAKREF
-// #define DEBUG_RNA_WEAKREF
 
-struct GHash *id_weakref_pool = nullptr;
-static PyObject *id_free_weakref_cb(PyObject *weakinfo_pair, PyObject *weakref);
-static PyMethodDef id_free_weakref_cb_def = {
-    "id_free_weakref_cb", (PyCFunction)id_free_weakref_cb, METH_O, nullptr};
-
-/**
- * Only used when there are values left on exit (causing memory leaks).
- */
-static void id_weakref_pool_free_value_fn(void *p)
+// Weak ownership by ID/Main, with callback context lifetime independent of the
+// backend owner. Holding weakref.getweakrefs() must not retain a freed pool.
+using LifetimeInvalidate = void (*)(PyObject *, PyObject **);
+struct LifetimePool {
+  void *owner;
+  bool retired = false;
+  std::unordered_map<PyObject *, LifetimeInvalidate> refs;
+};
+static std::unordered_map<void *, std::shared_ptr<LifetimePool>> lifetime_pools;
+static bool lifetime_ready = false;
+static void lifetime_invalidate_iterator(PyObject *, PyObject **);
+static void lifetime_invalidate_pointer(PyObject *object, PyObject **)
 {
-  GHash *weakinfo_hash = static_cast<GHash *>(p);
-  BLI_ghash_free(weakinfo_hash, nullptr, nullptr);
+  pyrna_invalidate(reinterpret_cast<BPy_DummyPointerRNA *>(object));
 }
-
-/* Adds a reference to the list, remember to decref. */
-static GHash *id_weakref_pool_get(ID *id)
+static void *lifetime_owner(const PointerRNA *ptr)
 {
-  GHash *weakinfo_hash = static_cast<GHash *>(BLI_ghash_lookup(id_weakref_pool, (void *)id));
-  if (weakinfo_hash == nullptr) {
-    /* This could be a set, values are used to keep a reference back to the ID
-     * (all of them are the same). */
-    weakinfo_hash = BLI_ghash_ptr_new("rna_id");
-    BLI_ghash_insert(id_weakref_pool, id, weakinfo_hash);
+  return ptr->owner_id ? static_cast<void *>(ptr->owner_id) :
+         ptr->data == G_MAIN ? static_cast<void *>(G_MAIN) : nullptr;
+}
+static void lifetime_capsule_free(PyObject *capsule)
+{
+  delete static_cast<std::shared_ptr<LifetimePool> *>(PyCapsule_GetPointer(capsule, "bpy.lifetime.pool"));
+}
+static PyObject *lifetime_weak_callback(PyObject *capsule, PyObject *weakref)
+{
+  auto pool = *static_cast<std::shared_ptr<LifetimePool> *>(PyCapsule_GetPointer(capsule, "bpy.lifetime.pool"));
+  if (!pool->retired) {
+    auto found = pool->refs.find(weakref);
+    if (found != pool->refs.end()) {
+      pool->refs.erase(found);
+      Py_DECREF(weakref); // release the registry's reference, not the argument's
+    }
   }
-  return weakinfo_hash;
-}
-
-/* Called from pyrna_struct_CreatePyObject() and pyrna_prop_CreatePyObject(). */
-static void id_weakref_pool_add(ID *id, BPy_DummyPointerRNA *pyrna)
-{
-  PyObject *weakref;
-  PyObject *weakref_capsule;
-  PyObject *weakref_cb_py;
-
-  /* Create a new function instance and insert the list as 'self'
-   * so we can remove ourself from it. */
-  GHash *weakinfo_hash = id_weakref_pool_get(id); /* New or existing. */
-
-  weakref_capsule = PyCapsule_New(weakinfo_hash, nullptr, nullptr);
-  weakref_cb_py = PyCFunction_New(&id_free_weakref_cb_def, weakref_capsule);
-  Py_DECREF(weakref_capsule);
-
-  /* Add weakref to weakinfo_hash list. */
-  weakref = PyWeakref_NewRef((PyObject *)pyrna, weakref_cb_py);
-
-  Py_DECREF(weakref_cb_py); /* Function owned by the weakref now. */
-
-  /* Important to add at the end of the hash, since first removal looks at the end. */
-
-  /* Using a hash table as a set, all 'id's are the same. */
-  BLI_ghash_insert(weakinfo_hash, weakref, id);
-  /* weakinfo_hash owns the weakref */
-}
-
-/* Workaround to get the last id without a lookup. */
-static ID *_id_tmp_ptr;
-static void value_id_set(void *id)
-{
-  _id_tmp_ptr = (ID *)id;
-}
-
-static void id_release_weakref_list(struct ID *id, GHash *weakinfo_hash);
-static PyObject *id_free_weakref_cb(PyObject *weakinfo_pair, PyObject *weakref)
-{
-  /* Important to search backwards. */
-  GHash *weakinfo_hash = static_cast<GHash *>(PyCapsule_GetPointer(weakinfo_pair, nullptr));
-
-  if (BLI_ghash_len(weakinfo_hash) > 1) {
-    BLI_ghash_remove(weakinfo_hash, weakref, nullptr, nullptr);
-  }
-  else { /* Get the last id and free it. */
-    BLI_ghash_remove(weakinfo_hash, weakref, nullptr, value_id_set);
-    id_release_weakref_list(_id_tmp_ptr, weakinfo_hash);
-  }
-
-  Py_DECREF(weakref);
-
   Py_RETURN_NONE;
 }
-
-static void id_release_weakref_list(struct ID *id, GHash *weakinfo_hash)
+static PyMethodDef lifetime_callback_def = {"_lifetime_release", lifetime_weak_callback, METH_O, nullptr};
+static void lifetime_register(void *owner, PyObject *object, LifetimeInvalidate invalidate)
 {
-  GHashIterator weakinfo_hash_iter;
-
-  BLI_ghashIterator_init(&weakinfo_hash_iter, weakinfo_hash);
-
-#  ifdef DEBUG_RNA_WEAKREF
-  fprintf(stdout, "id_release_weakref: '%s', %d items\n", id->name, BLI_ghash_len(weakinfo_hash));
-#  endif
-
-  while (!BLI_ghashIterator_done(&weakinfo_hash_iter)) {
-    PyObject *weakref = (PyObject *)BLI_ghashIterator_getKey(&weakinfo_hash_iter);
-    PyObject *item = pyweakref_get_ref(weakref);
-    if (item) {
-#  ifdef DEBUG_RNA_WEAKREF
-      PyC_ObSpit("id_release_weakref item ", item);
-#  endif
-      pyrna_invalidate((BPy_DummyPointerRNA *)item);
-      Py_DECREF(item);
+  if (!owner || !lifetime_ready) return;
+  auto &slot = lifetime_pools[owner];
+  if (!slot) { slot = std::make_shared<LifetimePool>(); slot->owner = owner; }
+  auto pool = slot;
+  auto *held = new std::shared_ptr<LifetimePool>(pool);
+  PyObject *capsule = PyCapsule_New(held, "bpy.lifetime.pool", lifetime_capsule_free);
+  PyObject *callback = capsule ? PyCFunction_New(&lifetime_callback_def, capsule) : nullptr;
+  Py_XDECREF(capsule);
+  PyObject *weakref = callback ? PyWeakref_NewRef(object, callback) : nullptr;
+  Py_XDECREF(callback);
+  if (weakref) {
+    if (pool->retired) {
+      PyObject *storage = nullptr;
+      invalidate(object, &storage);
+      Py_XDECREF(storage);
+      Py_DECREF(weakref);
     }
-
-    Py_DECREF(weakref);
-
-    BLI_ghashIterator_step(&weakinfo_hash_iter);
+    else {
+      pool->refs.emplace(weakref, invalidate);
+    }
   }
-
-  BLI_ghash_remove(id_weakref_pool, (void *)id, nullptr, nullptr);
-  BLI_ghash_free(weakinfo_hash, nullptr, nullptr);
+  else if (!capsule) {
+    delete held;
+  }
 }
-
-static void id_release_weakref(struct ID *id)
+static void lifetime_release(void *owner)
 {
-  GHash *weakinfo_hash = static_cast<GHash *>(BLI_ghash_lookup(id_weakref_pool, (void *)id));
-  if (weakinfo_hash) {
-    id_release_weakref_list(id, weakinfo_hash);
+  auto found = lifetime_pools.find(owner);
+  if (found == lifetime_pools.end()) return;
+  auto pool = found->second;
+  lifetime_pools.erase(found);
+  pool->retired = true;
+  auto refs = std::move(pool->refs);
+  PyObject *storage = nullptr;
+  for (const auto &[weakref, invalidate] : refs) {
+    PyObject *object = pyweakref_get_ref(weakref);
+    if (object) { invalidate(object, &storage); Py_DECREF(object); }
+    Py_DECREF(weakref);
   }
+  Py_XDECREF(storage);
 }
 
-#endif /* USE_PYRNA_INVALIDATE_WEAKREF */
 
 struct BPy_NamePropAsPyObject_Cache {
   PyObject *(*nameprop_as_py_object_fn)(const char *, Py_ssize_t);
@@ -426,24 +388,21 @@ static PyObject *pyrna_struct_get_nameprop_as_pyobject(
   return nullptr;
 }
 
+void BPY_pointer_release(void *owner)
+{
+  if (!lifetime_ready || !Py_IsInitialized()) return;
+  PyGILState_STATE gilstate = PyGILState_Ensure();
+  PyObject *type, *value, *trace;
+  PyErr_Fetch(&type, &value, &trace);
+  lifetime_release(owner);
+  if (PyErr_Occurred()) PyErr_WriteUnraisable(nullptr);
+  PyErr_Restore(type, value, trace);
+  PyGILState_Release(gilstate);
+}
+
 void BPY_id_release(ID *id)
 {
-#ifdef USE_PYRNA_INVALIDATE_GC
-  id_release_gc(id);
-#endif
-
-#ifdef USE_PYRNA_INVALIDATE_WEAKREF
-  /* Check for nullptr since this may run before Python has been started. */
-  if (id_weakref_pool != nullptr) {
-    PyGILState_STATE gilstate = PyGILState_Ensure();
-
-    id_release_weakref(id);
-
-    PyGILState_Release(gilstate);
-  }
-#endif /* USE_PYRNA_INVALIDATE_WEAKREF */
-
-  (void)id;
+  BPY_pointer_release(id);
 }
 
 #ifdef USE_PEDANTIC_WRITE
@@ -1269,6 +1228,7 @@ static PyObject *pyrna_prop_array_repr(BPy_PropertyArrayRNA *self)
 
 static PyObject *pyrna_func_repr(BPy_FunctionRNA *self)
 {
+  if (!self->ptr->type) return PyUnicode_FromString("<bpy_func removed>");
   return PyUnicode_FromFormat("<%.200s %.200s.%.200s()>",
                               Py_TYPE(self)->tp_name,
                               RNA_struct_identifier(self->ptr->type),
@@ -6969,6 +6929,10 @@ static PyObject *pyrna_func_vectorcall(PyObject *callable,
 {
   /* NOTE: both BPy_StructRNA and BPy_PropertyRNA can be used here. */
   BPy_FunctionRNA *self = reinterpret_cast<BPy_FunctionRNA *>(callable);
+  if (!self->ptr->type) {
+    PyErr_SetString(PyExc_ReferenceError, "RNA function owner has been removed");
+    return nullptr;
+  }
   PointerRNA *self_ptr = &self->ptr.value();
   FunctionRNA *self_func = self->func;
 
@@ -8138,6 +8102,7 @@ static PyObject *pyrna_prop_collection_iter_new(PyTypeObject *type,
       reinterpret_cast<BPy_PropertyCollectionIterRNA *>(self);
   if (self_prop_iter) {
     self_prop_iter->iter = std::nullopt;
+    self_prop_iter->invalidated = false;
   }
 
   return self;
@@ -8235,12 +8200,27 @@ static PyObject *pyrna_prop_collection_iter_CreatePyObject(PointerRNA *ptr, Prop
   UNUSED_VARS_NDEBUG(self_property);
 #  endif
 
+  lifetime_register(lifetime_owner(ptr), self, lifetime_invalidate_iterator);
   return self;
+}
+
+static void lifetime_invalidate_iterator(PyObject *object, PyObject **)
+{
+  auto *self = reinterpret_cast<BPy_PropertyCollectionIterRNA *>(object);
+  self->invalidated = true;
+  if (self->iter.has_value()) {
+    RNA_property_collection_end(&self->iter.value());
+    self->iter.reset();
+  }
 }
 
 static PyObject *pyrna_prop_collection_iter(PyObject *self)
 {
   BPy_PropertyRNA *self_property = reinterpret_cast<BPy_PropertyRNA *>(self);
+  if (!self_property->ptr->type) {
+    PyErr_SetString(PyExc_ReferenceError, "RNA collection owner has been removed");
+    return nullptr;
+  }
   return pyrna_prop_collection_iter_CreatePyObject(&self_property->ptr.value(),
                                                    self_property->prop);
 }
@@ -8249,7 +8229,11 @@ static PyObject *pyrna_prop_collection_iter_next(PyObject *self)
 {
   BPy_PropertyCollectionIterRNA *self_property = reinterpret_cast<BPy_PropertyCollectionIterRNA *>(
       self);
-  if (self_property->iter->valid == false) {
+  if (self_property->invalidated) {
+    PyErr_SetString(PyExc_ReferenceError, "RNA iterator owner has been removed");
+    return nullptr;
+  }
+  if (!self_property->iter.has_value() || self_property->iter->valid == false) {
     /* Free collection iterator immediately before tp_dealloc, to break cycles the GC can not
      * solve, between e.g. USE_PYRNA_STRUCT_REFERENCE and RNA_DepsgraphIterator.py_instance. */
     if (self_property->iter.has_value()) {
@@ -8365,6 +8349,8 @@ static PyObject *pyrna_func_CreatePyObject(const PointerRNA *ptr, FunctionRNA *f
   }
 
   BLI_assert(pyfunc->ptr.has_value());
+  pyfunc->in_weakreflist = nullptr;
+  lifetime_register(lifetime_owner(ptr), self, lifetime_invalidate_pointer);
 
   return reinterpret_cast<PyObject *>(pyfunc);
 }
@@ -8730,11 +8716,9 @@ static PyObject *pyrna_struct_CreatePyObject_from_type(const PointerRNA *ptr,
 
   // PyC_ObSpit("NewStructRNA: ", (PyObject *)pyrna);
 
-#ifdef USE_PYRNA_INVALIDATE_WEAKREF
-  if (ptr->owner_id) {
-    id_weakref_pool_add(ptr->owner_id, (BPy_DummyPointerRNA *)pyrna);
+if (ptr->owner_id || ptr->type != RNA_BlendData) {
+    lifetime_register(lifetime_owner(ptr), reinterpret_cast<PyObject *>(pyrna), lifetime_invalidate_pointer);
   }
-#endif
 
   return reinterpret_cast<PyObject *>(pyrna);
 }
@@ -8834,11 +8818,7 @@ PyObject *pyrna_prop_CreatePyObject(PointerRNA *ptr, PropertyRNA *prop)
   pyrna->in_weakreflist = nullptr;
 #endif
 
-#ifdef USE_PYRNA_INVALIDATE_WEAKREF
-  if (ptr->owner_id) {
-    id_weakref_pool_add(ptr->owner_id, (BPy_DummyPointerRNA *)pyrna);
-  }
-#endif
+lifetime_register(lifetime_owner(ptr), reinterpret_cast<PyObject *>(pyrna), lifetime_invalidate_pointer);
 
   return reinterpret_cast<PyObject *>(pyrna);
 }
@@ -8918,29 +8898,16 @@ void BPY_rna_init()
 #endif
 
 #ifdef USE_PYRNA_INVALIDATE_WEAKREF
-  BLI_assert(id_weakref_pool == nullptr);
-  id_weakref_pool = BLI_ghash_ptr_new("rna_global_pool");
+  BLI_assert(lifetime_pools.empty());
+  lifetime_ready = true;
 #endif
 }
 
 void BPY_rna_exit()
 {
 #ifdef USE_PYRNA_INVALIDATE_WEAKREF
-  /* This can help track down which kinds of data were not released.
-   * If they were in fact freed by Blender, printing their names
-   * will crash giving a useful error with address sanitizer. The likely cause
-   * for this list not being empty is a missing call to: #BKE_libblock_free_data_py. */
-  const int id_weakref_pool_len = BLI_ghash_len(id_weakref_pool);
-  if (id_weakref_pool_len != 0) {
-    printf("Found %d unreleased ID's\n", id_weakref_pool_len);
-    GHashIterator gh_iter;
-    GHASH_ITER (gh_iter, id_weakref_pool) {
-      ID *id = static_cast<ID *>(BLI_ghashIterator_getKey(&gh_iter));
-      printf("ID: %s\n", id->name);
-    }
-  }
-  BLI_ghash_free(id_weakref_pool, nullptr, id_weakref_pool_free_value_fn);
-  id_weakref_pool = nullptr;
+  while (!lifetime_pools.empty()) lifetime_release(lifetime_pools.begin()->first);
+  lifetime_ready = false;
 #endif
 }
 
