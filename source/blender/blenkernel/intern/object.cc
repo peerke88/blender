@@ -3105,8 +3105,56 @@ void BKE_object_tfm_copy(Object *object_dst, const Object *object_src)
 #undef TFMCPY4D
 }
 
+/* Inka local-matrix prototype. The application validates authored input before
+ * publishing this derived backend-column-major cache. No Python/Qt evaluation
+ * or transform-channel decomposition occurs on the depsgraph evaluation thread.
+ * Non-Inka objects and shapes retain the original Blender transform path. */
+static bool inka_local_matrix_get(const Object *ob, float r_mat[4][4])
+{
+  if (ob->type != OB_EMPTY || !ob->id.properties) {
+    return false;
+  }
+  const IDProperty *identity = IDP_GetPropertyFromGroup(ob->id.properties,
+                                                     "_inka_object_identity_v1");
+  const IDProperty *input = IDP_GetPropertyFromGroup(ob->id.properties,
+                                                  "_inka_local_matrix_cache_v1");
+  if (!identity || identity->type != IDP_GROUP || !input || input->type != IDP_GROUP) {
+    return false;
+  }
+  const IDProperty *version = IDP_GetPropertyFromGroup(input, "version");
+  const IDProperty *matrix = IDP_GetPropertyFromGroup(input, "matrix");
+  if (!version || version->type != IDP_INT || IDP_int_get(version) != 1 || !matrix ||
+      matrix->type != IDP_ARRAY || matrix->subtype != IDP_DOUBLE || matrix->len != 16)
+  {
+    return false;
+  }
+  float candidate[4][4];
+  const double *values = IDP_array_double_get(matrix);
+  for (int column = 0; column < 4; column++) {
+    for (int row = 0; row < 4; row++) {
+      candidate[column][row] = float(values[column * 4 + row]);
+      if (!std::isfinite(values[column * 4 + row]) || !std::isfinite(candidate[column][row])) {
+        return false;
+      }
+    }
+  }
+  if (candidate[0][3] != 0.0f || candidate[1][3] != 0.0f || candidate[2][3] != 0.0f ||
+      candidate[3][3] != 1.0f)
+  {
+    return false;
+  }
+  copy_m4_m4(r_mat, candidate);
+  return true;
+}
+
 void BKE_object_to_mat3(const Object *ob, float r_mat[3][3]) /* no parent */
 {
+  float direct[4][4];
+  if (inka_local_matrix_get(ob, direct)) {
+    copy_m3_m4(r_mat, direct);
+    return;
+  }
+
   float smat[3][3];
   float rmat[3][3];
 
@@ -3120,6 +3168,10 @@ void BKE_object_to_mat3(const Object *ob, float r_mat[3][3]) /* no parent */
 
 void BKE_object_to_mat4(const Object *ob, float r_mat[4][4])
 {
+  if (inka_local_matrix_get(ob, r_mat)) {
+    return;
+  }
+
   float tmat[3][3];
 
   BKE_object_to_mat3(ob, tmat);
